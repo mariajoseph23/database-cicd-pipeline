@@ -50,6 +50,16 @@ No Jenkins server to maintain. No static AWS credentials. The pipeline uses GitH
 8. Deploy to production
 9. Verify and notify
 
+## ⚠️ Note on Backup Step
+
+The backup step simulates a production-grade process and requires:
+
+- AWS IAM role via OIDC
+- S3 bucket
+- Live PostgreSQL instance
+
+In this demo project, the step may fail intentionally without real infrastructure.
+
 ## CI/CD Workflows
 
 The pipeline consists of two workflows:
