@@ -1,8 +1,36 @@
 # Database CI/CD Automation Pipeline
 
+## The Problem
+
+Database deployments are high-risk because:
+
+- A single bad query can break production
+- Rollbacks are difficult or impossible
+- Changes are often manual and error-prone
+
+## The Solution
+
+This pipeline introduces:
+
+- Automated SQL validation (prevents bad queries)
+- Migration testing in isolated environments
+- Automated backup before deployment
+- Manual approval for production releases
+- Rollback capability using S3 backups
+
 ## Overview
 
-A production-grade CI/CD pipeline for automating database schema migrations using GitHub Actions, Git-based version control, and PostgreSQL. Every schema change is validated, tested against an ephemeral database, deployed to staging, approved via GitHub Environments, and applied to production — with automatic rollback on failure.
+A production-grade CI/CD pipeline for automating database schema migrations using GitHub Actions, Git-based version control, and PostgreSQL.
+
+Every schema change is:
+
+- validated
+- tested against an ephemeral database
+- deployed to staging
+- approved via GitHub Environments
+- applied to production
+
+All with automatic rollback on failure.
 
 No Jenkins server to maintain. No static AWS credentials. The pipeline uses GitHub Actions with OIDC federation to assume a short-lived IAM role, eliminating the need to store long-lived access keys as secrets.
 
@@ -10,8 +38,21 @@ No Jenkins server to maintain. No static AWS credentials. The pipeline uses GitH
 
 ![Pipeline Diagram](architecture/pipeline-flow.svg)
 
-The pipeline consists of two workflows:
+## 🔄 Pipeline Flow
 
+1. Developer pushes SQL migration
+2. GitHub Actions triggers pipeline
+3. SQL is validated (lint + safety checks)
+4. Migrations tested in PostgreSQL container
+5. Production backup created (pg_dump → S3)
+6. Deploy to staging + run integration tests
+7. Manual approval required
+8. Deploy to production
+9. Verify and notify
+
+## CI/CD Workflows
+
+The pipeline consists of two workflows:
 **[`database-deploy.yml`](.github/workflows/database-deploy.yml)** (main pipeline; workflow name **Database Migration Pipeline**) — On **push to `main`** (paths: `migrations/**`, `scripts/**`, or this workflow file), runs the full chain: validate → test → backup → staging → production (with **environment** approval) → verify, plus a failure notifier. On **pull requests** to `main` that only change `migrations/**`, it runs **Validate** and **Test** (ephemeral Postgres) only — no AWS backup or deploy jobs. **`workflow_dispatch`** runs the same full chain on `main` with optional `dry_run`, `skip_staging`, and `target_version`. Production failures trigger rollback from the S3 backup.
 
 **[`pr-check.yml`](.github/workflows/pr-check.yml)** (workflow name **PR Migration Check**) — Runs on **pull requests** to `main` when `migrations/**` or `scripts/**` changes. It validates, runs migrations against a service container, checks idempotency, and can post a PR comment.
