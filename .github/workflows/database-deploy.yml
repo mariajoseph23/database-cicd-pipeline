@@ -1,0 +1,561 @@
+# =============================================================================
+# Database CI/CD Pipeline — GitHub Actions Workflow
+# =============================================================================
+# Triggered on pushes to main that modify the migrations/ directory.
+# Can also be triggered manually via workflow_dispatch.
+#
+# Stages:
+#   1. Validate    — Lint SQL, check naming conventions, safety checks
+#   2. Test        — Spin up a PostgreSQL container and run all migrations
+#   3. Backup      — Snapshot production before deploying
+#   4. Staging     — Deploy migrations to staging environment
+#   5. Approval    — Wait for manual approval via GitHub Environments
+#   6. Production  — Deploy migrations to production (auto-rollback on failure)
+#   7. Verify      — Post-deploy health checks and notification
+# =============================================================================
+
+name: Database Migration Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'migrations/**'
+      - 'scripts/**'
+      - '.github/workflows/database-deploy.yml'
+
+  pull_request:
+    branches: [main]
+    paths:
+      - 'migrations/**'
+
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: 'Migrate to specific version (blank = latest). Example: V3'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run — validate only, do not apply'
+        required: false
+        type: boolean
+        default: false
+      skip_staging:
+        description: 'Skip staging (hotfixes only)'
+        required: false
+        type: boolean
+        default: false
+
+# Prevent concurrent deployments
+concurrency:
+  group: database-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DB_PORT: '5432'
+  MIGRATIONS_DIR: './migrations'
+  AWS_REGION: 'us-east-1'
+
+# OIDC token for AWS authentication (no static keys needed)
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+
+  # ===========================================================================
+  # Job 1: Validate SQL migrations
+  # ===========================================================================
+  validate:
+    name: Validate SQL
+    runs-on: ubuntu-latest
+    outputs:
+      migration_count: ${{ steps.discover.outputs.count }}
+      migration_files: ${{ steps.discover.outputs.files }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for diff detection
+
+      - name: Discover migrations
+        id: discover
+        run: |
+          FILES=$(find ${{ env.MIGRATIONS_DIR }} -name 'V*.sql' -type f | sort -V)
+
+          if [ -z "$FILES" ]; then
+            echo "::error::No migration files found in ${{ env.MIGRATIONS_DIR }}"
+            exit 1
+          fi
+
+          COUNT=$(echo "$FILES" | wc -l)
+          echo "Found ${COUNT} migration file(s)"
+          echo "$FILES"
+
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$FILES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Validate naming convention
+        run: |
+          echo "Checking migration file naming..."
+          ERRORS=0
+
+          for file in ${{ env.MIGRATIONS_DIR }}/V*.sql; do
+            filename=$(basename "$file")
+
+            # Must match V<number>_<description>.sql
+            if [[ ! "$filename" =~ ^V[0-9]+_[a-z_]+\.sql$ ]]; then
+              echo "::error file=${file}::Invalid naming: ${filename}. Expected: V<number>_<description>.sql (lowercase, underscores)"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+
+          if [ $ERRORS -gt 0 ]; then
+            exit 1
+          fi
+
+          echo "✓ All files follow naming convention"
+
+      - name: Check for dangerous operations
+        run: |
+          echo "Scanning for unsafe SQL patterns..."
+          WARNINGS=0
+
+          for file in ${{ env.MIGRATIONS_DIR }}/V*.sql; do
+            filename=$(basename "$file")
+
+            # DROP TABLE without IF EXISTS
+            if grep -qi 'DROP TABLE' "$file" && ! grep -qi 'IF EXISTS' "$file"; then
+              echo "::warning file=${file}::${filename} contains DROP TABLE without IF EXISTS"
+              WARNINGS=$((WARNINGS + 1))
+            fi
+
+            # TRUNCATE (data loss risk)
+            if grep -qi 'TRUNCATE' "$file"; then
+              echo "::warning file=${file}::${filename} contains TRUNCATE — verify this is intentional"
+              WARNINGS=$((WARNINGS + 1))
+            fi
+
+            # ALTER TABLE without transaction (outside BEGIN/COMMIT)
+            if grep -qi 'ALTER TABLE' "$file" && ! grep -qi 'BEGIN' "$file"; then
+              # Exception: files using CONCURRENTLY can't use transactions
+              if ! grep -qi 'CONCURRENTLY' "$file"; then
+                echo "::warning file=${file}::${filename} has ALTER TABLE outside a transaction block"
+                WARNINGS=$((WARNINGS + 1))
+              fi
+            fi
+
+            # Empty file check
+            LINES=$(grep -c '[^[:space:]]' "$file" || true)
+            if [ "$LINES" -eq 0 ]; then
+              echo "::error file=${file}::${filename} is empty"
+              exit 1
+            fi
+          done
+
+          echo "✓ Safety checks complete (${WARNINGS} warning(s))"
+
+      - name: Check version ordering
+        run: |
+          echo "Verifying version numbers are sequential..."
+          PREV=0
+
+          for file in $(find ${{ env.MIGRATIONS_DIR }} -name 'V*.sql' | sort -V); do
+            VER=$(basename "$file" | grep -oP '^V\K\d+')
+
+            if [ "$VER" -le "$PREV" ]; then
+              echo "::error::Version V${VER} is not greater than previous V${PREV}. Versions must be strictly increasing."
+              exit 1
+            fi
+
+            PREV=$VER
+          done
+
+          echo "✓ Version ordering is correct (V1 through V${PREV})"
+
+  # ===========================================================================
+  # Job 2: Test migrations against a fresh PostgreSQL container
+  # ===========================================================================
+  test:
+    name: Test Migrations
+    needs: validate
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U testuser"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Run all migrations against test database
+        run: |
+          chmod +x scripts/deploy_database.sh
+
+          scripts/deploy_database.sh \
+            --host localhost \
+            --port ${{ env.DB_PORT }} \
+            --user testuser \
+            --password testpass \
+            --database testdb \
+            --migrations-dir ${{ env.MIGRATIONS_DIR }}
+
+      - name: Verify schema integrity
+        run: |
+          PGPASSWORD=testpass psql -h localhost -p ${{ env.DB_PORT }} -U testuser -d testdb \
+            -v ON_ERROR_STOP=1 -c "
+              -- Verify all migrations tracked
+              SELECT version, description, applied_at, execution_time
+              FROM schema_migrations ORDER BY version;
+
+              -- List all tables
+              SELECT table_name
+              FROM information_schema.tables
+              WHERE table_schema = 'public'
+              ORDER BY table_name;
+
+              -- List all indexes
+              SELECT indexname, tablename
+              FROM pg_indexes
+              WHERE schemaname = 'public'
+              ORDER BY tablename, indexname;
+
+              -- Check for invalid constraints
+              SELECT conname, conrelid::regclass
+              FROM pg_constraint
+              WHERE NOT convalidated;
+            "
+
+      - name: Test idempotency (run migrations again)
+        run: |
+          echo "Running migrations a second time to verify idempotency..."
+
+          scripts/deploy_database.sh \
+            --host localhost \
+            --port ${{ env.DB_PORT }} \
+            --user testuser \
+            --password testpass \
+            --database testdb \
+            --migrations-dir ${{ env.MIGRATIONS_DIR }}
+
+          echo "✓ Idempotency check passed — no errors on re-run"
+
+  # ===========================================================================
+  # Job 3: Backup production database
+  # ===========================================================================
+  backup:
+    name: Backup Production
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    outputs:
+      backup_key: ${{ steps.backup.outputs.backup_key }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Create pre-deployment backup
+        id: backup
+        env:
+          DB_HOST: ${{ secrets.DB_PROD_HOST }}
+          DB_USER: ${{ secrets.DB_PROD_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_PROD_NAME }}
+          BACKUP_BUCKET: ${{ secrets.BACKUP_S3_BUCKET }}
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          BACKUP_FILE="pre_deploy_${TIMESTAMP}_run${GITHUB_RUN_NUMBER}.dump"
+          S3_KEY="backups/${BACKUP_FILE}"
+
+          echo "Creating backup: ${BACKUP_FILE}..."
+
+          PGPASSWORD="${DB_PASSWORD}" pg_dump \
+            -h "${DB_HOST}" \
+            -p ${{ env.DB_PORT }} \
+            -U "${DB_USER}" \
+            -d "${DB_NAME}" \
+            --format=custom \
+            --compress=9 \
+            --verbose \
+            --file="/tmp/${BACKUP_FILE}"
+
+          BACKUP_SIZE=$(du -sh "/tmp/${BACKUP_FILE}" | cut -f1)
+          echo "Backup size: ${BACKUP_SIZE}"
+
+          echo "Uploading to s3://${BACKUP_BUCKET}/${S3_KEY}..."
+          aws s3 cp "/tmp/${BACKUP_FILE}" "s3://${BACKUP_BUCKET}/${S3_KEY}"
+
+          echo "backup_key=${S3_KEY}" >> "$GITHUB_OUTPUT"
+          echo "✓ Backup uploaded: s3://${BACKUP_BUCKET}/${S3_KEY}"
+
+  # ===========================================================================
+  # Job 4: Deploy to staging
+  # ===========================================================================
+  deploy-staging:
+    name: Deploy Staging
+    needs: backup
+    if: "!inputs.skip_staging"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Run migrations on staging
+        env:
+          DB_HOST: ${{ secrets.DB_STAGING_HOST }}
+          DB_USER: ${{ secrets.DB_STAGING_USER }}
+          DB_PASSWORD: ${{ secrets.DB_STAGING_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_STAGING_NAME }}
+        run: |
+          chmod +x scripts/deploy_database.sh
+
+          scripts/deploy_database.sh \
+            --host "${DB_HOST}" \
+            --port ${{ env.DB_PORT }} \
+            --user "${DB_USER}" \
+            --password "${DB_PASSWORD}" \
+            --database "${DB_NAME}" \
+            --migrations-dir ${{ env.MIGRATIONS_DIR }} \
+            ${{ inputs.target_version && format('--target-version {0}', inputs.target_version) || '' }}
+
+      - name: Integration tests on staging
+        env:
+          DB_HOST: ${{ secrets.DB_STAGING_HOST }}
+          DB_USER: ${{ secrets.DB_STAGING_USER }}
+          DB_PASSWORD: ${{ secrets.DB_STAGING_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_STAGING_NAME }}
+        run: |
+          echo "Running integration tests against staging..."
+
+          PGPASSWORD="${DB_PASSWORD}" psql \
+            -h "${DB_HOST}" \
+            -p ${{ env.DB_PORT }} \
+            -U "${DB_USER}" \
+            -d "${DB_NAME}" \
+            -v ON_ERROR_STOP=1 \
+            -c "
+              SELECT COUNT(*) AS applied_migrations FROM schema_migrations;
+
+              SELECT table_name FROM information_schema.tables
+              WHERE table_schema = 'public' ORDER BY table_name;
+
+              SELECT indexname, tablename FROM pg_indexes
+              WHERE schemaname = 'public' ORDER BY tablename, indexname;
+            "
+
+          echo "✓ Staging integration tests passed"
+
+  # ===========================================================================
+  # Job 5: Deploy to production (requires environment approval)
+  # ===========================================================================
+  deploy-production:
+    name: Deploy Production
+    needs: [backup, deploy-staging]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !inputs.dry_run
+    runs-on: ubuntu-latest
+
+    # This is where the approval gate lives — configure required reviewers
+    # in GitHub repo Settings → Environments → "production"
+    environment:
+      name: production
+      url: https://console.aws.amazon.com/rds
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Run migrations on production
+        id: deploy
+        env:
+          DB_HOST: ${{ secrets.DB_PROD_HOST }}
+          DB_USER: ${{ secrets.DB_PROD_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_PROD_NAME }}
+        run: |
+          chmod +x scripts/deploy_database.sh
+
+          scripts/deploy_database.sh \
+            --host "${DB_HOST}" \
+            --port ${{ env.DB_PORT }} \
+            --user "${DB_USER}" \
+            --password "${DB_PASSWORD}" \
+            --database "${DB_NAME}" \
+            --migrations-dir ${{ env.MIGRATIONS_DIR }} \
+            ${{ inputs.target_version && format('--target-version {0}', inputs.target_version) || '' }}
+
+      - name: Rollback on failure
+        if: failure() && steps.deploy.outcome == 'failure'
+        env:
+          DB_HOST: ${{ secrets.DB_PROD_HOST }}
+          DB_USER: ${{ secrets.DB_PROD_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_PROD_NAME }}
+          BACKUP_BUCKET: ${{ secrets.BACKUP_S3_BUCKET }}
+          BACKUP_KEY: ${{ needs.backup.outputs.backup_key }}
+        run: |
+          echo "::error::Production deployment failed — initiating rollback"
+
+          if [ -z "${BACKUP_KEY}" ]; then
+            echo "::error::No backup key found — cannot rollback automatically"
+            exit 1
+          fi
+
+          echo "Downloading backup: s3://${BACKUP_BUCKET}/${BACKUP_KEY}"
+          aws s3 cp "s3://${BACKUP_BUCKET}/${BACKUP_KEY}" /tmp/rollback.dump
+
+          echo "Restoring database from backup..."
+          PGPASSWORD="${DB_PASSWORD}" pg_restore \
+            -h "${DB_HOST}" \
+            -p ${{ env.DB_PORT }} \
+            -U "${DB_USER}" \
+            -d "${DB_NAME}" \
+            --clean \
+            --if-exists \
+            --verbose \
+            /tmp/rollback.dump
+
+          echo "✓ ROLLBACK COMPLETE — database restored to pre-deployment state"
+
+  # ===========================================================================
+  # Job 6: Post-deploy verification and notification
+  # ===========================================================================
+  verify:
+    name: Verify & Notify
+    needs: deploy-production
+    if: always() && needs.deploy-production.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Post-deployment health check
+        env:
+          DB_HOST: ${{ secrets.DB_PROD_HOST }}
+          DB_USER: ${{ secrets.DB_PROD_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_PROD_NAME }}
+        run: |
+          PGPASSWORD="${DB_PASSWORD}" psql \
+            -h "${DB_HOST}" \
+            -p 5432 \
+            -U "${DB_USER}" \
+            -d "${DB_NAME}" \
+            -v ON_ERROR_STOP=1 \
+            -c "
+              SELECT version, description, applied_at, execution_time
+              FROM schema_migrations ORDER BY version DESC LIMIT 5;
+
+              SELECT
+                current_database() AS database,
+                pg_size_pretty(pg_database_size(current_database())) AS size,
+                (SELECT count(*) FROM information_schema.tables WHERE table_schema='public') AS table_count,
+                now() AS verified_at;
+            "
+
+          echo "✓ Post-deployment verification passed"
+
+      - name: Summary
+        run: |
+          echo "## Database Migration Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ✅ Deployed successfully |" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Job 7: Notify on failure (runs if any previous job failed)
+  # ===========================================================================
+  notify-failure:
+    name: Notify Failure
+    needs: [validate, test, backup, deploy-staging, deploy-production]
+    if: always() && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Failure summary
+        run: |
+          echo "## ❌ Database Migration FAILED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+
+      # Uncomment to enable Slack notifications
+      # - name: Notify Slack
+      #   uses: slackapi/slack-github-action@v1
+      #   with:
+      #     payload: |
+      #       {
+      #         "text": "🚨 DB Migration FAILED — Run #${{ github.run_number }} by ${{ github.actor }}",
+      #         "channel": "#deployments"
+      #       }
+      #   env:
+      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

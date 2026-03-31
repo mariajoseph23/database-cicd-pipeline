@@ -1,0 +1,210 @@
+# =============================================================================
+# Pull Request Validation — SQL Migration Checks
+# =============================================================================
+# Runs on every PR that modifies migration files. Fast feedback loop:
+# validates SQL, runs against a throwaway PostgreSQL container, and
+# posts a summary comment on the PR.
+# =============================================================================
+
+name: PR Migration Check
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'migrations/**'
+      - 'scripts/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  pr-check:
+    name: Validate & Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U testuser"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Detect new migration files in this PR
+        id: changed
+        run: |
+          # Get list of added/modified migration files in this PR
+          CHANGED=$(git diff --name-only --diff-filter=AM origin/main...HEAD -- 'migrations/V*.sql' || true)
+
+          if [ -z "$CHANGED" ]; then
+            echo "No new migration files in this PR"
+            echo "has_migrations=false" >> "$GITHUB_OUTPUT"
+          else
+            COUNT=$(echo "$CHANGED" | wc -l)
+            echo "New/modified migrations: ${COUNT}"
+            echo "$CHANGED"
+            echo "has_migrations=true" >> "$GITHUB_OUTPUT"
+            echo "files<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$CHANGED" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate naming and safety
+        if: steps.changed.outputs.has_migrations == 'true'
+        run: |
+          ERRORS=0
+          WARNINGS=0
+          REPORT=""
+
+          for file in $(echo "${{ steps.changed.outputs.files }}"); do
+            filename=$(basename "$file")
+            REPORT="${REPORT}\n### ${filename}\n"
+
+            # Naming convention
+            if [[ ! "$filename" =~ ^V[0-9]+_[a-z_]+\.sql$ ]]; then
+              REPORT="${REPORT}- ❌ Invalid naming convention\n"
+              ERRORS=$((ERRORS + 1))
+            else
+              REPORT="${REPORT}- ✅ Naming convention\n"
+            fi
+
+            # Transaction wrapping
+            if grep -qi 'BEGIN' "$file"; then
+              REPORT="${REPORT}- ✅ Wrapped in transaction\n"
+            elif grep -qi 'CONCURRENTLY' "$file"; then
+              REPORT="${REPORT}- ⚠️ No transaction (CONCURRENTLY requires this)\n"
+            else
+              REPORT="${REPORT}- ⚠️ No explicit transaction block\n"
+              WARNINGS=$((WARNINGS + 1))
+            fi
+
+            # Dangerous operations
+            if grep -qi 'DROP TABLE' "$file"; then
+              if grep -qi 'IF EXISTS' "$file"; then
+                REPORT="${REPORT}- ⚠️ Contains DROP TABLE (with IF EXISTS)\n"
+              else
+                REPORT="${REPORT}- ❌ DROP TABLE without IF EXISTS\n"
+                ERRORS=$((ERRORS + 1))
+              fi
+            fi
+
+            # Migration tracking
+            if grep -qi 'schema_migrations' "$file"; then
+              REPORT="${REPORT}- ✅ Records in schema_migrations\n"
+            else
+              REPORT="${REPORT}- ❌ Missing schema_migrations INSERT\n"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+
+          echo -e "$REPORT" > /tmp/validation-report.md
+          echo "errors=${ERRORS}" >> "$GITHUB_OUTPUT"
+          echo "warnings=${WARNINGS}" >> "$GITHUB_OUTPUT"
+
+          if [ $ERRORS -gt 0 ]; then
+            echo "::error::Validation failed with ${ERRORS} error(s)"
+            exit 1
+          fi
+
+      - name: Run all migrations against test database
+        run: |
+          chmod +x scripts/deploy_database.sh
+
+          scripts/deploy_database.sh \
+            --host localhost \
+            --port 5432 \
+            --user testuser \
+            --password testpass \
+            --database testdb \
+            --migrations-dir ./migrations 2>&1 | tee /tmp/migration-output.txt
+
+      - name: Capture schema summary
+        id: schema
+        run: |
+          TABLES=$(PGPASSWORD=testpass psql -h localhost -p 5432 -U testuser -d testdb -t -A -c \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
+
+          INDEXES=$(PGPASSWORD=testpass psql -h localhost -p 5432 -U testuser -d testdb -t -A -c \
+            "SELECT count(*) FROM pg_indexes WHERE schemaname='public'")
+
+          MIGRATIONS=$(PGPASSWORD=testpass psql -h localhost -p 5432 -U testuser -d testdb -t -A -c \
+            "SELECT count(*) FROM schema_migrations")
+
+          echo "tables=${TABLES}" >> "$GITHUB_OUTPUT"
+          echo "indexes=${INDEXES}" >> "$GITHUB_OUTPUT"
+          echo "migrations=${MIGRATIONS}" >> "$GITHUB_OUTPUT"
+
+      - name: Post PR comment with results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tables = '${{ steps.schema.outputs.tables }}' || '?';
+            const indexes = '${{ steps.schema.outputs.indexes }}' || '?';
+            const migrations = '${{ steps.schema.outputs.migrations }}' || '?';
+            const status = '${{ job.status }}' === 'success' ? '✅ Passed' : '❌ Failed';
+
+            const body = `## Database Migration Check ${status}
+
+            | Metric | Value |
+            |--------|-------|
+            | **Tables** | ${tables} |
+            | **Indexes** | ${indexes} |
+            | **Migrations applied** | ${migrations} |
+            | **Test database** | PostgreSQL 15 (ephemeral) |
+
+            <details>
+            <summary>Migration output</summary>
+
+            \`\`\`
+            ${require('fs').readFileSync('/tmp/migration-output.txt', 'utf8').slice(0, 3000)}
+            \`\`\`
+            </details>
+
+            *Run #${{ github.run_number }} triggered by @${{ github.actor }}*`;
+
+            // Find and update existing comment, or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Database Migration Check')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
